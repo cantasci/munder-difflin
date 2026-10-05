@@ -6,10 +6,12 @@ const loadTs = require('./load-ts.cjs');
 
 const {
   OUTPUT_TAIL_CHARS,
+  WORKER_FIRST_PROMPT,
   appendTail,
   detectStartupFailure,
   neverStartedReason,
-  stripAnsi
+  stripAnsi,
+  workerSpawnArgs
 } = loadTs('src/main/workerStartup.ts');
 
 test('ANSI paint is stripped before matching', () => {
@@ -39,6 +41,21 @@ test('an unavailable model and a missing login are told apart', () => {
 test('ordinary output is not a failure', () => {
   assert.equal(detectStartupFailure('Welcome to Claude Code\n> \n? for shortcuts'), null);
   assert.equal(detectStartupFailure(''), null);
+});
+
+test('a spawn-queue Claude worker gets a first prompt that sends it to its inbox (nothing else wakes it)', () => {
+  const args = workerSpawnArgs('opus', true);
+  assert.deepEqual(args.slice(0, 2), ['--model', 'opus']);
+  assert.equal(args.length, 3);
+  assert.equal(args[2], WORKER_FIRST_PROMPT);
+  assert.match(WORKER_FIRST_PROMPT, /read your inbox now/i);
+});
+
+test('a non-Claude worker or a missing model gets no extra args', () => {
+  assert.deepEqual(workerSpawnArgs('gpt-5-codex', false), ['--model', 'gpt-5-codex']);
+  assert.deepEqual(workerSpawnArgs(undefined, false), []);
+  assert.deepEqual(workerSpawnArgs('  ', true), [WORKER_FIRST_PROMPT]);
+  assert.deepEqual(workerSpawnArgs(42, true), [WORKER_FIRST_PROMPT]);
 });
 
 test('a worker nobody woke is told apart from one whose CLI ignored the prompt', () => {

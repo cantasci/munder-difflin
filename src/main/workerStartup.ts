@@ -46,6 +46,20 @@ export function detectStartupFailure(output: string): string | null {
   return null;
 }
 
+/** The first turn of a spawn-queue Claude worker. Its task is dispatched to its hive
+ *  inbox, but the window only wakes agents it tracks — and spawn-queue workers are
+ *  not among them — so without this prompt the session sits at an empty prompt
+ *  forever. After this first turn the Stop hook keeps draining the inbox. */
+export const WORKER_FIRST_PROMPT =
+  'Your task was sent to your hive inbox by god. Read your inbox now and start it. If it is still empty, wait a few seconds and read it again.';
+
+/** CLI args for a spawn-queue worker: its model, and — for Claude — the first prompt. */
+export function workerSpawnArgs(model: unknown, claude: boolean): string[] {
+  const args = typeof model === 'string' && model.trim() ? ['--model', model.trim()] : [];
+  if (claude) args.push(WORKER_FIRST_PROMPT);
+  return args;
+}
+
 /** Why a worker that never took a turn is being let go (no CLI error on screen). */
 export function neverStartedReason(idleMinutes: number, wakerAvailable: boolean): string {
   return wakerAvailable

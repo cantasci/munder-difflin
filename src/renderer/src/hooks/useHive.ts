@@ -19,12 +19,9 @@ import type { AgentProvider } from '../../../shared/agentProvider';
 import { acquireTerminal, resetTerminal, isTerminalAutomationSafe } from '@/components/terminalPool';
 import { deliverWithAcknowledgement } from './queueDelivery';
 import { OFFICE_CAST, DEFAULT_CHARACTER } from '@/scene/office/cast';
+import { floorLookFor } from './floorLook';
 
 const GOD_ID = 'god';
-/** Accent palette for MAIN-spawned (voice-hired) agents — picked deterministically
- *  from the agent id so the same agent always gets the same colour. Mirrors the
- *  AddAgentModal palette. */
-const SPAWN_ACCENTS = ['coral', 'mint', 'sky', 'lemon', 'lilac', 'peach'] as const;
 const GOD_PTY = `pty-${GOD_ID}`;
 
 const REMOTE_CONTROL_SETTLE_MS = 1500;
@@ -893,24 +890,22 @@ export function useHive(config: HarnessConfig | null): void {
       if (!rec?.id) return;
       // addAgent is idempotent, but bail early if the renderer already carded it.
       if (useStore.getState().agents.some((a) => a.id === rec.id)) return;
-      const key = (rec.name || rec.id).toLowerCase();
-      const character =
-        OFFICE_CAST.find((m) => m.name === key || m.displayName.toLowerCase() === key)?.name ??
-        DEFAULT_CHARACTER;
-      let h = 0;
-      for (const ch of rec.id) h = (h + ch.charCodeAt(0)) % SPAWN_ACCENTS.length;
+      const look = floorLookFor(rec, OFFICE_CAST, DEFAULT_CHARACTER);
       const project = (rec.cwd || '').split(/[\\/]/).filter(Boolean).pop() || 'hive';
+      // A spawn-queue worker starts on its own first prompt (main hands it one), so it
+      // is already busy: carding it 'idle' would let the inbox-wake nudge type over it.
+      const worker = rec.role === 'worker';
       const agent: Agent = {
         id: rec.id,
         name: rec.name || rec.id,
-        character,
-        accent: SPAWN_ACCENTS[h],
+        character: look.character as Agent['character'],
+        accent: look.accent,
         description: rec.role || 'a fresh harness',
         project,
         tmuxTarget: '',
         cwd: rec.cwd,
-        status: 'idle',
-        action: 'starting up',
+        status: worker ? 'working' : 'idle',
+        action: worker ? 'reading its inbox' : 'starting up',
         progress: 0,
         currentStation: 'desk',
         ptyId: rec.id,

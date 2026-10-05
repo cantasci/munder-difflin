@@ -10,7 +10,7 @@ import { join, resolve, sep, basename, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { request as httpsRequest } from 'node:https';
 import { PtyManager, type SpawnOptions } from './pty';
-import { detectStartupFailure, neverStartedReason } from './workerStartup';
+import { detectStartupFailure, neverStartedReason, workerSpawnArgs } from './workerStartup';
 import { resolveCommand as resolveCliCommand } from './shellEnv';
 import { initAutoUpdater } from './updater';
 import { RealtimeFloorWatcher } from './realtimeFloorWatcher';
@@ -395,6 +395,11 @@ function teardownPty(id: string): void {
   // 0) Revoke this id's broker capability (if any). Idempotent + harmless for a
   //    non-worker PTY; ensures a dead worker's token can never reach an integration.
   try { integrationBroker.revoke(id); } catch { /* best-effort */ }
+  // A spawn-queue worker was carded on the floor by main (hive:agentSpawned), not by
+  // the renderer — so its exit (finished, reaped, failed to start) must take it off too.
+  if (liveWorkers.has(id)) {
+    try { liveWebContents()?.send('hive:agentArchived', { id: ptyToAgent.get(id) ?? id }); } catch { /* window torn down */ }
+  }
   // 1) Archive the agent — retained + flagged; only live-PTY agents are active.
   const agentId = ptyToAgent.get(id);
   if (agentId) {
@@ -4200,6 +4205,8 @@ interface SpawnRequest {
   slack?: { channel: string; thread_ts: string };     // reply target + where failures surface
   isolate?: boolean;                                   // default true (fresh worktree)
   tokenCap?: number;                                   // optional per-worker token cap (advisory P1)
+  character?: string;                                  // optional floor look (Office cast name, e.g. "pam")
+  accent?: string;                                     // optional floor accent (e.g. "mint")
 }
 
 /** Polling cadence — matches the hive router. */
@@ -4332,7 +4339,7 @@ async function processSpawnRequest(filePath: string): Promise<void> {
   }
   const spawnOpts: AgentSpawnOptions = {
     id: workerId, cwd, command, cols: 120, rows: 32,
-    args: raw.model ? ['--model', raw.model] : [],
+    args: workerSpawnArgs(raw.model, isClaudeProvider(inferAgentProvider(command, raw.provider))),
     hive: meta, isolate, provider: raw.provider, env: brokerEnv
   };
 
@@ -4351,6 +4358,15 @@ async function processSpawnRequest(filePath: string): Promise<void> {
   const tokenCap = typeof raw.tokenCap === 'number' && Number.isFinite(raw.tokenCap) && raw.tokenCap > 0
     ? raw.tokenCap : undefined;
   liveWorkers.set(workerId, { workerId, reqId, name: meta.name, slack, baseBranch, spawnedAt: Date.now(), tokenCap });
+  // Put the worker on the floor like any MAIN-spawned agent (useHive builds its card),
+  // with the look its request asked for — a /deliver seat names its character + accent.
+  try {
+    liveWebContents()?.send('hive:agentSpawned', {
+      id: workerId, name: meta.name, provider: inferAgentProvider(command, raw.provider), cwd, command, role: 'worker',
+      character: typeof raw.character === 'string' ? raw.character : undefined,
+      accent: typeof raw.accent === 'string' ? raw.accent : undefined
+    });
+  } catch { /* window torn down */ }
 
   // Dispatch the objective via the standard inbox path (zero new transport),
   // reusing the autonomous-request preamble so the worker gets the exact Slack
