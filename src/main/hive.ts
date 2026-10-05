@@ -156,6 +156,10 @@ export interface RegistryAgent extends AgentMeta {
    *  (e.g. "ClaudeTerminalHarness") spawns into a nonexistent dir and fails; this
    *  flag makes that visible instead of letting it slip through silently. */
   cwdValid?: boolean;
+  /** Why the agent failed (e.g. a worker whose CLI refused its first turn), so
+   *  whoever spawned it — Michael, /deliver's `dl md-seats` — can name the cause. */
+  lastError?: string;
+  lastErrorAt?: number;
 }
 
 export interface Registry {
@@ -811,6 +815,22 @@ export class HiveManager {
       this.writeJson(join(root, 'registry.json'), reg);
       this.appendLog({ kind: 'archive', agentId: id, archived });
       this.commit(`hive: ${archived ? 'archive' : 'unarchive'} ${id}`);
+    } catch { /* best-effort — never crash a lifecycle handler */ }
+  }
+
+  /** Record why an agent failed on its registry entry (and in the log). Best-effort. */
+  setAgentError(id: string, error: string): void {
+    const root = this.root();
+    if (!root) return;
+    try {
+      const reg = this.registry();
+      const agent = reg.agents[id];
+      if (!agent) return;
+      agent.lastError = error;
+      agent.lastErrorAt = Date.now();
+      this.writeJson(join(root, 'registry.json'), reg);
+      this.appendLog({ kind: 'error', agentId: id, error });
+      this.commit(`hive: error ${id}`);
     } catch { /* best-effort — never crash a lifecycle handler */ }
   }
 

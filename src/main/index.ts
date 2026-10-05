@@ -10,6 +10,7 @@ import { join, resolve, sep, basename, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { request as httpsRequest } from 'node:https';
 import { PtyManager, type SpawnOptions } from './pty';
+import { detectStartupFailure, neverStartedReason } from './workerStartup';
 import { resolveCommand as resolveCliCommand } from './shellEnv';
 import { initAutoUpdater } from './updater';
 import { RealtimeFloorWatcher } from './realtimeFloorWatcher';
@@ -1136,7 +1137,9 @@ function writeFleetSnapshot(): void {
           inboxBacklog: hive.inboxBacklog(id)
         };
       });
-    hive.writeFleetSnapshot({ ts: now, agents });
+    // workerCap: how many spawn-queue workers run at once — more requests wait in the
+    // queue, so an orchestrator seating a team can tell "queued" from "lost".
+    hive.writeFleetSnapshot({ ts: now, workerCap: Math.max(1, readConfig().maxConcurrentWorkers ?? 4), agents });
   } catch (e) {
     console.error('[fleet] snapshot failed:', e);
   }
@@ -4375,6 +4378,10 @@ function workerTokensUsed(workerId: string): number {
   return s ? s.input + s.output + s.cacheRead + s.cacheCreation : 0;
 }
 
+/** A never-started worker must be this quiet before its screen is read for a
+ *  startup error — a CLI that refused its turn sits silent at its prompt. */
+const STARTUP_ERROR_QUIET_MS = 30_000;
+
 /** Throttle for the GC sweep — git checks are cheap but pointless every 1.5s tick. */
 const GC_SWEEP_MS = 60_000;
 let lastGcSweepAt = 0;
@@ -4468,14 +4475,44 @@ async function ephemeralWorkerTick(): Promise<void> {
       }
       const idleMs = ptyManager.idleFor(workerId);
       if (idleMs === undefined) continue; // PTY already gone; teardownPty cleans up
+      // A worker that has not taken a single turn yet: when its CLI printed a fatal
+      // error (no usage left, unknown model, not logged in) and went quiet, release
+      // it now and record why — instead of a silent "idle" reap 20 min later.
+      const neverStarted = workerTokensUsed(workerId) === 0;
+      if (neverStarted && idleMs > STARTUP_ERROR_QUIET_MS) {
+        const failure = detectStartupFailure(ptyManager.recentOutput(workerId));
+        if (failure) {
+          rec.releasing = true;
+          console.warn(`[worker] ${workerId} failed to start: ${failure}`);
+          hive.setAgentError(workerId, `failed to start: ${failure}`);
+          informGod(
+            `[worker failed to start] ${workerId}`,
+            `Worker ${workerId} could not take its first turn: ${failure}. It was released without doing any work; spawn it again once the cause is fixed (for a model problem: another model).`,
+            rec.slack
+          );
+          ptyManager.kill(workerId);
+          continue;
+        }
+      }
       if (idleMs > idleTimeoutMs) {
         rec.releasing = true;
-        console.warn(`[worker] reaping idle ${workerId} (${Math.round(idleMs / 60000)}min idle)`);
-        informGod(
-          `[worker reaped — idle] ${workerId}`,
-          `Worker ${workerId} produced no output for ${Math.round(idleMs / 60000)} min (> the ${Math.round(idleTimeoutMs / 60000)} min cap) and never signaled done, so it was reaped. Any committed work on its branch is preserved for you.`,
-          rec.slack
-        );
+        const idleMin = Math.round(idleMs / 60000);
+        if (neverStarted) {
+          // Nobody can tell "idle after work" from "never woken" in the inbox, so say which.
+          const wakerAvailable = BrowserWindow.getAllWindows().length > 0
+            && !(lastSuspendAt !== null && lastSuspendAt > rec.spawnedAt);
+          const reason = neverStartedReason(idleMin, wakerAvailable);
+          console.warn(`[worker] reaping ${workerId} — ${reason}`);
+          hive.setAgentError(workerId, reason);
+          informGod(`[worker never started] ${workerId}`, `Worker ${workerId} ${reason}. It was reaped without doing any work; spawn it again.`, rec.slack);
+        } else {
+          console.warn(`[worker] reaping idle ${workerId} (${idleMin}min idle)`);
+          informGod(
+            `[worker reaped — idle] ${workerId}`,
+            `Worker ${workerId} produced no output for ${idleMin} min (> the ${Math.round(idleTimeoutMs / 60000)} min cap) and never signaled done, so it was reaped. Any committed work on its branch is preserved for you.`,
+            rec.slack
+          );
+        }
         ptyManager.kill(workerId);
       }
     }
