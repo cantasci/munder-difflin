@@ -10,6 +10,7 @@ import { join, resolve, sep, basename, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { request as httpsRequest } from 'node:https';
 import { PtyManager, type SpawnOptions } from './pty';
+import { detectStartupFailure, neverStartedReason, workerSpawnArgs } from './workerStartup';
 import { resolveCommand as resolveCliCommand } from './shellEnv';
 import { initAutoUpdater } from './updater';
 import { RealtimeFloorWatcher } from './realtimeFloorWatcher';
@@ -394,6 +395,11 @@ function teardownPty(id: string): void {
   // 0) Revoke this id's broker capability (if any). Idempotent + harmless for a
   //    non-worker PTY; ensures a dead worker's token can never reach an integration.
   try { integrationBroker.revoke(id); } catch { /* best-effort */ }
+  // A spawn-queue worker was carded on the floor by main (hive:agentSpawned), not by
+  // the renderer — so its exit (finished, reaped, failed to start) must take it off too.
+  if (liveWorkers.has(id)) {
+    try { liveWebContents()?.send('hive:agentArchived', { id: ptyToAgent.get(id) ?? id }); } catch { /* window torn down */ }
+  }
   // 1) Archive the agent — retained + flagged; only live-PTY agents are active.
   const agentId = ptyToAgent.get(id);
   if (agentId) {
@@ -1136,7 +1142,9 @@ function writeFleetSnapshot(): void {
           inboxBacklog: hive.inboxBacklog(id)
         };
       });
-    hive.writeFleetSnapshot({ ts: now, agents });
+    // workerCap: how many spawn-queue workers run at once — more requests wait in the
+    // queue, so an orchestrator seating a team can tell "queued" from "lost".
+    hive.writeFleetSnapshot({ ts: now, workerCap: Math.max(1, readConfig().maxConcurrentWorkers ?? 4), agents });
   } catch (e) {
     console.error('[fleet] snapshot failed:', e);
   }
@@ -4197,6 +4205,8 @@ interface SpawnRequest {
   slack?: { channel: string; thread_ts: string };     // reply target + where failures surface
   isolate?: boolean;                                   // default true (fresh worktree)
   tokenCap?: number;                                   // optional per-worker token cap (advisory P1)
+  character?: string;                                  // optional floor look (Office cast name, e.g. "pam")
+  accent?: string;                                     // optional floor accent (e.g. "mint")
 }
 
 /** Polling cadence — matches the hive router. */
@@ -4329,7 +4339,7 @@ async function processSpawnRequest(filePath: string): Promise<void> {
   }
   const spawnOpts: AgentSpawnOptions = {
     id: workerId, cwd, command, cols: 120, rows: 32,
-    args: raw.model ? ['--model', raw.model] : [],
+    args: workerSpawnArgs(raw.model, isClaudeProvider(inferAgentProvider(command, raw.provider))),
     hive: meta, isolate, provider: raw.provider, env: brokerEnv
   };
 
@@ -4348,6 +4358,15 @@ async function processSpawnRequest(filePath: string): Promise<void> {
   const tokenCap = typeof raw.tokenCap === 'number' && Number.isFinite(raw.tokenCap) && raw.tokenCap > 0
     ? raw.tokenCap : undefined;
   liveWorkers.set(workerId, { workerId, reqId, name: meta.name, slack, baseBranch, spawnedAt: Date.now(), tokenCap });
+  // Put the worker on the floor like any MAIN-spawned agent (useHive builds its card),
+  // with the look its request asked for — a /deliver seat names its character + accent.
+  try {
+    liveWebContents()?.send('hive:agentSpawned', {
+      id: workerId, name: meta.name, provider: inferAgentProvider(command, raw.provider), cwd, command, role: 'worker',
+      character: typeof raw.character === 'string' ? raw.character : undefined,
+      accent: typeof raw.accent === 'string' ? raw.accent : undefined
+    });
+  } catch { /* window torn down */ }
 
   // Dispatch the objective via the standard inbox path (zero new transport),
   // reusing the autonomous-request preamble so the worker gets the exact Slack
@@ -4374,6 +4393,10 @@ function workerTokensUsed(workerId: string): number {
   const s = usageProvider.getAgentUsage(workerId);
   return s ? s.input + s.output + s.cacheRead + s.cacheCreation : 0;
 }
+
+/** A never-started worker must be this quiet before its screen is read for a
+ *  startup error — a CLI that refused its turn sits silent at its prompt. */
+const STARTUP_ERROR_QUIET_MS = 30_000;
 
 /** Throttle for the GC sweep — git checks are cheap but pointless every 1.5s tick. */
 const GC_SWEEP_MS = 60_000;
@@ -4468,14 +4491,44 @@ async function ephemeralWorkerTick(): Promise<void> {
       }
       const idleMs = ptyManager.idleFor(workerId);
       if (idleMs === undefined) continue; // PTY already gone; teardownPty cleans up
+      // A worker that has not taken a single turn yet: when its CLI printed a fatal
+      // error (no usage left, unknown model, not logged in) and went quiet, release
+      // it now and record why — instead of a silent "idle" reap 20 min later.
+      const neverStarted = workerTokensUsed(workerId) === 0;
+      if (neverStarted && idleMs > STARTUP_ERROR_QUIET_MS) {
+        const failure = detectStartupFailure(ptyManager.recentOutput(workerId));
+        if (failure) {
+          rec.releasing = true;
+          console.warn(`[worker] ${workerId} failed to start: ${failure}`);
+          hive.setAgentError(workerId, `failed to start: ${failure}`);
+          informGod(
+            `[worker failed to start] ${workerId}`,
+            `Worker ${workerId} could not take its first turn: ${failure}. It was released without doing any work; spawn it again once the cause is fixed (for a model problem: another model).`,
+            rec.slack
+          );
+          ptyManager.kill(workerId);
+          continue;
+        }
+      }
       if (idleMs > idleTimeoutMs) {
         rec.releasing = true;
-        console.warn(`[worker] reaping idle ${workerId} (${Math.round(idleMs / 60000)}min idle)`);
-        informGod(
-          `[worker reaped — idle] ${workerId}`,
-          `Worker ${workerId} produced no output for ${Math.round(idleMs / 60000)} min (> the ${Math.round(idleTimeoutMs / 60000)} min cap) and never signaled done, so it was reaped. Any committed work on its branch is preserved for you.`,
-          rec.slack
-        );
+        const idleMin = Math.round(idleMs / 60000);
+        if (neverStarted) {
+          // Nobody can tell "idle after work" from "never woken" in the inbox, so say which.
+          const wakerAvailable = BrowserWindow.getAllWindows().length > 0
+            && !(lastSuspendAt !== null && lastSuspendAt > rec.spawnedAt);
+          const reason = neverStartedReason(idleMin, wakerAvailable);
+          console.warn(`[worker] reaping ${workerId} — ${reason}`);
+          hive.setAgentError(workerId, reason);
+          informGod(`[worker never started] ${workerId}`, `Worker ${workerId} ${reason}. It was reaped without doing any work; spawn it again.`, rec.slack);
+        } else {
+          console.warn(`[worker] reaping idle ${workerId} (${idleMin}min idle)`);
+          informGod(
+            `[worker reaped — idle] ${workerId}`,
+            `Worker ${workerId} produced no output for ${idleMin} min (> the ${Math.round(idleTimeoutMs / 60000)} min cap) and never signaled done, so it was reaped. Any committed work on its branch is preserved for you.`,
+            rec.slack
+          );
+        }
         ptyManager.kill(workerId);
       }
     }

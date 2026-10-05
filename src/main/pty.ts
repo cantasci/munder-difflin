@@ -6,6 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { ensureKilled } from './procKill';
 import { expandTilde } from './fs';
 import { captureFromLoginShell, userShellPath } from './shellEnv';
+import { appendTail } from './workerStartup';
 
 /** APPEND the hive's bundled-node dir (`<HIVE_ROOT>/bin/runtime`, which holds a
  *  shim literally named `node`) to a child's PATH.
@@ -48,6 +49,9 @@ interface PtySession {
   /** True after the child has emitted at least one frame. Automation waits for
    *  this before typing, so startup prompts cannot outrun the TUI subscription. */
   hasOutput: boolean;
+  /** The last OUTPUT_TAIL_CHARS of raw output, so the main process can read an
+   *  error a worker's CLI printed even when no window is attached to show it. */
+  outputTail: string;
 }
 
 export interface SpawnOptions {
@@ -681,6 +685,7 @@ export class PtyManager {
         command: resolved,
         lastOutputAt: Date.now(),
         hasOutput: false,
+        outputTail: '',
         owner
       };
       this.sessions.set(opts.id, session);
@@ -691,6 +696,7 @@ export class PtyManager {
         if (this.sessions.get(opts.id) !== session) return;
         session.hasOutput = true;
         session.lastOutputAt = Date.now();
+        session.outputTail = appendTail(session.outputTail, data);
         // Route to the session's owner window (multi-window owner routing).
         this.safeSend(`pty:data:${opts.id}`, data, session.owner);
       });
@@ -782,6 +788,11 @@ export class PtyManager {
   idleFor(id: string): number | undefined {
     const s = this.sessions.get(id);
     return s ? Date.now() - s.lastOutputAt : undefined;
+  }
+
+  /** The PTY's most recent raw output (bounded tail), or '' if no such PTY. */
+  recentOutput(id: string): string {
+    return this.sessions.get(id)?.outputTail ?? '';
   }
 
   /** Bulk-kill every PTY for app quit / reset. This is wholesale shutdown, not
